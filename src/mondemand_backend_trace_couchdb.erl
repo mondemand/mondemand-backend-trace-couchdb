@@ -23,6 +23,8 @@
 
 -record (state, { config,
                   couch,
+                  connected = false,
+                  backoff = 1000,
                   stats = dict:new ()
                 }).
 
@@ -45,26 +47,14 @@ required_apps () ->
 %% gen_server callbacks
 %%====================================================================
 init (Config) ->
-  {CouchHost,CouchPort, CouchUser, CouchPassword} =
-    proplists:get_value (couch, Config),
-
-  % open and test couch connection
-  Server =
-    couchbeam:server_connection (CouchHost, CouchPort, "",
-                                 [{basic_auth, {CouchUser, CouchPassword}}]),
-
   % initialize all stats to zero
   InitialStats =
     mondemand_server_util:initialize_stats ([ errors, processed ] ),
 
-  case couchbeam:server_info (Server) of
-    {ok, _} ->
-      {ok, Couch} = couchbeam:open_or_create_db (Server, "traces"),
-      { ok, #state{ config = Config, couch = Couch, stats = InitialStats }};
-    {error, _} ->
-      io:format ("ERROR: Can't start CouchDB not running!~n"),
-      {stop, no_couchdb}
-  end.
+  % make sure we attempt a connect
+  erlang:send (self(), attempt_connect),
+
+  { ok, #state{ config = Config, stats = InitialStats }}.
 
 handle_call ({stats}, _From,
              State = #state { stats = Stats }) ->
@@ -76,24 +66,59 @@ handle_call (Request, From, State) ->
 
 handle_cast ({process, Event},
              State = #state { couch = Couch,
+                              connected = Connected,
                               stats = Stats
                             }) ->
-  Doc = lwes_event:from_udp_packet (Event, json_eep18),
-
-  NewStats =
-    case couchbeam:save_doc (Couch, Doc) of
-      {ok, _Doc1} ->
-         mondemand_server_util:increment_stat (processed, Stats);
-      _ ->
-         mondemand_server_util:increment_stat (errors, Stats)
+  { NewStats, NewConnected } =
+    case Connected of
+      true ->
+        Doc = lwes_event:from_udp_packet (Event, json_eep18),
+        case couchbeam:save_doc (Couch, Doc) of
+          {ok, _Doc1} ->
+            { mondemand_server_util:increment_stat (processed, Stats),
+              Connected
+            };
+          {error, {conn_failed,{error,econnrefused}}} ->
+            % couchdb is down, attempt to reconnect
+            erlang:send (self(), attempt_connect),
+            { mondemand_server_util:increment_stat (errors, Stats),
+              connecting
+            };
+          Error ->
+            error_logger:error_msg ("Failure processing ~p",[Error]),
+            { mondemand_server_util:increment_stat (errors, Stats),
+              Connected
+            }
+        end;
+      false ->
+        { mondemand_server_util:increment_stat (errors, Stats), Connected };
+      connecting ->
+        { mondemand_server_util:increment_stat (errors, Stats), Connected }
     end,
 
-  {noreply, State#state { stats = NewStats }};
+  {noreply, State#state { stats = NewStats, connected = NewConnected }};
 
 handle_cast (Request, State) ->
   error_logger:warning_msg ("~p : Unrecognized cast ~p~n",[?MODULE, Request]),
   { noreply, State }.
 
+handle_info (attempt_connect,
+             State = #state { config = Config,
+                              backoff = Backoff
+                            }) ->
+  { Couch, Connected, NewBackoff } =
+    case attempt_couchdb_connection (Config) of
+      {ok, C} -> {C, true, 1000};
+      {error, Error} ->
+        error_logger:error_msg
+          ( "Can't start CouchDB ~p retrying in ~p milliseconds",
+            [Error, Backoff]),
+        erlang:send_after (Backoff, self(), attempt_connect),
+        { undefined, false, erlang:min (Backoff * 2, 60000) }
+    end,
+  { noreply,
+    State#state { couch = Couch, backoff = NewBackoff, connected = Connected }
+  };
 handle_info (Request, State) ->
   error_logger:warning_msg ("~p : Unrecognized info ~p~n",[?MODULE, Request]),
   {noreply, State}.
@@ -108,6 +133,21 @@ code_change (_OldVsn, State, _Extra) ->
 %% Internal
 %%====================================================================
 
+attempt_couchdb_connection (Config) ->
+  {CouchHost,CouchPort, CouchUser, CouchPassword} =
+    proplists:get_value (couch, Config),
+
+  % open and test couch connection
+  Server =
+    couchbeam:server_connection (CouchHost, CouchPort, "",
+                                 [{basic_auth, {CouchUser, CouchPassword}}]),
+
+  case couchbeam:server_info (Server) of
+    {ok, _} ->
+      couchbeam:open_or_create_db (Server, "traces");
+    {error, _} ->
+      {error, no_couchdb}
+  end.
 
 %%--------------------------------------------------------------------
 %%% Test functions

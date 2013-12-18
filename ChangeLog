@@ -1,2 +1,6 @@
+* Wed Dec 18 2013 Anthony Molinaro <anthonym@alumni.caltech.edu> 0.1.0
+- allow this plugin to start if couchdb is down, and attempt to restart the
+connection to couchdb if it goes down.
+
 * Wed Sep 11 2013 Anthony Molinaro <anthonym@alumni.caltech.edu> 0.0.0
 - initial version copied out of mondemand-server
